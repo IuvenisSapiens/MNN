@@ -19,6 +19,7 @@ from utils.custom_op import FakeLinear
 from utils.onnx_rebuilder import OnnxRebuilder
 from utils.mnn_converter import MNNConveter
 from utils.awq_quantizer import AwqQuantizer
+from utils.smooth_quantizer import SmoothQuantizer
 from utils.model_mapper import ModelMapper
 from utils.transformers import Embedding, Rotary, Decoder, Lm
 
@@ -36,9 +37,13 @@ class LlmExporter(torch.nn.Module):
         self.audio = None
         self.talker = None
         self.mtp = None
+        self.scale_emb = None
         self.args = args
         self.max_length = 1024
         self.stop_ids = []
+        self.sliding_attn_layers = []
+        self.attention_type = 'full'
+        self.sliding_window = 0
         self.dst_name = 'llm'
         # load config from args
         self.onnx_path = os.path.join(self.args.dst_path, 'onnx')
@@ -67,7 +72,7 @@ class LlmExporter(torch.nn.Module):
         if 'Qwen2.5-Omni' in model_path:
             from transformers import Qwen2_5OmniForConditionalGeneration
             self.model = Qwen2_5OmniForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto").eval()
-        elif 'Qwen2.5-VL' in model_path or 'Qwen2___5-VL' in model_path:
+        elif 'Qwen2.5-VL' in model_path or 'Qwen2___5-VL' in model_path or 'Lingshu' in model_path:
             from transformers import Qwen2_5_VLForConditionalGeneration
             self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path, torch_dtype='auto').eval()
         elif 'Qwen2-VL' in model_path:
@@ -151,7 +156,7 @@ class LlmExporter(torch.nn.Module):
         model_mapper = ModelMapper()
         self.model_type, self.model_map = model_mapper.get_map(self.config)
 
-        if self.args.awq:
+        if self.args.awq or self.args.smooth:
             self.model.float()
         if self.args.export is not None:
             # set norm's weight as float for export
@@ -175,6 +180,15 @@ class LlmExporter(torch.nn.Module):
                 self.head_dim = [self.hidden_size // atten_head for atten_head in self.num_attention_heads]
             else:
                 self.head_dim = self.hidden_size // self.num_attention_heads
+        # sliding attention layers
+        if hasattr(self, 'layer_types'): # gpt_oss
+            for i in range(len(self.layer_types)):
+                if self.layer_types[i] == 'sliding_attention':
+                    self.sliding_attn_layers.append(i)
+        if len(self.sliding_attn_layers) >= self.num_hidden_layers:
+            self.attention_type = 'sliding'
+        elif len(self.sliding_attn_layers) > 0:
+            self.attention_type = 'mix'
         # some export info
         if isinstance(self.num_attention_heads, list):
             self.past_kv_shape = [self.num_hidden_layers, 2, 1, 0, self.num_key_value_heads[0], self.head_dim]
@@ -202,8 +216,11 @@ class LlmExporter(torch.nn.Module):
             "system_prompt_template": prompt_template['system'].format(content='%s'),
             'user_prompt_template': prompt_template['user'].format(content='%s'),
             'assistant_prompt_template': prompt_template['assistant'].format(content='%s'),
-            'is_visual': False
+            'is_visual': False,
+            'attention_type': self.attention_type,
         }
+        if self.sliding_window > 0:
+            self.llm_config['sliding_window'] = self.sliding_window
         if 'jinja' in prompt_template:
             self.llm_config['jinja'] = prompt_template['jinja']
         # load modules
@@ -232,6 +249,10 @@ class LlmExporter(torch.nn.Module):
         if self.tie_word_embeddings:
             print("Tie word embeddings in lm, set lm quant bit to 8")
             self.args.lm_quant_bit = 8
+
+        if 'gemma' in self.model_type:
+            self.scale_emb = self.embed.embed_scale
+
         # Rotary
         self.rotary = Rotary(self)
         self.blocks = []
@@ -267,12 +288,39 @@ class LlmExporter(torch.nn.Module):
             self.mtp = Mtp.get_mtp(self.model_type)(self.mtp, self)
         return model_path
 
-    def get_attention_mask(self) -> torch.Tensor:
-        if self.model_type == 'chatglm':
-            return self.chatglm_attention_mask()
+    def full_attention_mask(self):
         if self.token_len:
             return torch.zeros([1, 1, 1, self.seq_len], dtype=torch.float32)
         return (1 - torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]))) * torch.finfo(torch.float32).min
+
+    def sliding_attention_mask(self, sliding_window: int):
+        if self.token_len:
+            sliding_mask = torch.zeros([1, 1, 1, self.seq_len], dtype=torch.float32)
+            num_tokens_to_mask = self.seq_len - sliding_window
+            if num_tokens_to_mask > 0:
+                sliding_mask[..., :num_tokens_to_mask] = torch.finfo(torch.float32).min
+            return sliding_mask
+        causal_mask = torch.tril(torch.ones(self.seq_len, self.seq_len, dtype=torch.bool))
+        query_indices = torch.arange(self.seq_len).view(-1, 1)
+        key_indices = torch.arange(self.seq_len).view(1, -1)
+        window_mask = (key_indices > query_indices - sliding_window)
+        final_mask_bool = causal_mask & window_mask
+        sliding_mask = torch.where(final_mask_bool, 0.0, torch.finfo(torch.float32).min)
+        return sliding_mask.view(1, 1, self.seq_len, self.seq_len)
+
+    def get_attention_mask(self) -> torch.Tensor:
+        if self.model_type == 'chatglm':
+            return self.chatglm_attention_mask()
+        if self.attention_type == 'full':
+            return self.full_attention_mask()
+        elif self.attention_type == 'sliding':
+            return self.sliding_attention_mask(self.sliding_window)
+        elif self.attention_type == 'mix':
+            full_mask = self.full_attention_mask()
+            sliding_mask = self.sliding_attention_mask(self.sliding_window)
+            return torch.stack([full_mask, sliding_mask], dim=0)
+
+        return None
 
     def get_position_ids(self, input_ids = None) -> torch.Tensor:
         if self.visual is not None and hasattr(self.visual, 'get_position_ids') and callable(getattr(self.visual, 'get_position_ids')):
@@ -327,11 +375,8 @@ class LlmExporter(torch.nn.Module):
                 cross_attention_mask: Optional[torch.Tensor] = None,
                 ):
         hidden_states = input_ids # llm forward without embedding
-        if self.model_type == 'gemma':
-            normalizer = torch.tensor(self.hidden_size**0.5, dtype=hidden_states.dtype)
-            hidden_states = hidden_states * normalizer
-        if self.model_type == 'gemma3' or self.model_type == 'gemma3_text': # if --test, comments these
-            hidden_states = hidden_states * self.embed.embed_scale
+        if self.scale_emb is not None:
+            hidden_states = hidden_states * self.scale_emb
         presents = [None for i in range(len(self.blocks))]
         rotary_pos_emb = self.rotary(position_ids)
         if self.args.test and rotary_pos_emb.dtype != hidden_states.dtype:
@@ -343,7 +388,15 @@ class LlmExporter(torch.nn.Module):
                 past_kv = past_key_values[i]
             else:
                 past_kv = None
-            hidden_states, kv = self.blocks[i](hidden_states, rotary_pos_emb, attention_mask, past_kv)
+
+            # sliding or full attn mask
+            if self.attention_type == 'mix':
+                is_sliding = i in self.sliding_attn_layers
+                layer_attention_mask = attention_mask[int(is_sliding)]
+            else:
+                layer_attention_mask = attention_mask
+
+            hidden_states, kv = self.blocks[i](hidden_states, rotary_pos_emb, layer_attention_mask, past_kv)
             presents[i] = kv
         talker_embeds = None
         if hasattr(self, 'talker') and self.talker is not None:
@@ -475,6 +528,13 @@ class LlmExporter(torch.nn.Module):
         return template
 
     def build_prompt(self, messages):
+        if hasattr(self.tokenizer, 'apply_chat_template'):
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            return prompt
         template = self.build_prompt_template()
         prompt = template['bos']
         for item in messages:
@@ -730,6 +790,11 @@ class LlmExporter(torch.nn.Module):
         self.awq_quantizer.quantize()
         self.is_awq_quantized = True
 
+    def smooth_quant(self):
+        self.smooth_quantizer = SmoothQuantizer(self)
+        self.smooth_quantizer.quantize()
+        self.is_smooth_quantized = True
+
     def export_vision(self):
         if self.visual is None:
             return
@@ -782,6 +847,8 @@ class LlmExporter(torch.nn.Module):
     def export(self, export_type):
         if self.args.awq:
             self.awq_quant()
+        if self.args.smooth:
+            self.smooth_quant()
         if self.args.hqq and self.args.sym:
             self.args.sym = False
         export_mnn = export_type == 'mnn'
@@ -891,9 +958,12 @@ class LlmExporter(torch.nn.Module):
             # add special tokens to vocab_list
             for index in special_list:
                 if index >= len(vocab_list):
-                    token = self.tokenizer.decode(index)
-                    token_encode = base64.b64encode(token.encode("utf-8")).decode("utf8")
-                    vocab_list.append(f'{token_encode} {0} {NORMAL}\n')
+                    try:
+                        token = self.tokenizer.decode(index)
+                        token_encode = base64.b64encode(token.encode("utf-8")).decode("utf8")
+                        vocab_list.append(f'{token_encode} {0} {NORMAL}\n')
+                    except:
+                        pass
             with open(file_path, "w", encoding="utf8") as fp:
                 write_header(fp, SENTENCEPIECE, special_list, prefix_list)
                 if self.model_type == "gemma3" or self.model_type == "gemma3-text":
@@ -956,10 +1026,11 @@ class LlmExporter(torch.nn.Module):
                     return u - 162
                 if u == 323:
                     return 173
-                if u == 65372: # |
-                    return 124
-                if u == 9601:  # _
-                    return 95
+                # need not convert using jinja
+                # if u == 65372: # |
+                #     return 124
+                # if u == 9601:  # _
+                #     return 95
                 return u
             vocab = self.tokenizer.get_vocab()
             vocab_list = ['<unk>' for i in range(len(vocab))]
@@ -1212,9 +1283,11 @@ def main():
     parser.add_argument('--hqq', action='store_true', help='Whether or not to use hqq quant.')
     parser.add_argument('--transformer_fuse', action='store_true', help='Whether or not to fuse vision transformer op.')
     parser.add_argument('--group_conv_native', action='store_true', help='Whether or not to keep native group_conv.')
+    parser.add_argument('--smooth', action='store_true', help='Whether or not to use smooth quant.')
     parser.add_argument('--sym', action='store_true', help='Whether or not to using symmetric quant (without zeropoint), defualt is False.')
     parser.add_argument('--seperate_embed', action='store_true', help='For lm and embed shared model, whether or not to sepearte embed to avoid quant, defualt is False, if True, embed weight will be seperate to embeddingbf16.bin.')
     parser.add_argument('--lora_split', action='store_true', help='Whether or not export lora split, defualt is False.')
+    parser.add_argument('--calib_data', type=str, default=None, help='calibration data path, defaut is `None` mean not use calib data.')
     args = parser.parse_args()
 
     model_path = args.path
